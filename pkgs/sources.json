@@ -1,0 +1,11 @@
+{
+  "engine": {
+    "version": "2.3.5",
+    "rev": "e7f22b2a5c2b8ac7996df5f79403d8b1386baa47",
+    "hash": "sha256-hNAkxRj5xgmFhAF9Napm5xp2m7OEn/f6Lb9JZBx13Dc="
+  },
+  "integration": {
+    "version": "2.3.3",
+    "hash": "sha256-w0JwJZhZtkcsU7TWX2SHntlxfRhN4LrV7N7emV02o4s="
+  }
+}

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Update Sophia NLU"
+  short_description: "Bump the pinned Sophia NLU engine and HA integration in this flake"

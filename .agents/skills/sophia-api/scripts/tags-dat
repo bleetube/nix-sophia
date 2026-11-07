@@ -1,0 +1,61 @@
+#!/usr/bin/env -S python3 -I
+"""Convert Sophia NLU's tags.dat to and from JSON.
+
+tags.dat is a bincode-style map of entity ID to tag string: a little-endian
+u64 entry count, then each key and value as a u64 byte length plus UTF-8.
+Entities without tags aren't stored.
+
+Usage:
+  tags-dat decode < tags.dat > tags.json
+  tags-dat encode < tags.json > tags.dat
+"""
+
+import json
+import struct
+import sys
+
+
+def decode(data):
+    pos = 0
+
+    def take(n):
+        nonlocal pos
+        if pos + n > len(data):
+            sys.exit("tags-dat: truncated file (format changed?)")
+        chunk = data[pos:pos + n]
+        pos += n
+        return chunk
+
+    def string():
+        (n,) = struct.unpack("<Q", take(8))
+        return take(n).decode()
+
+    (count,) = struct.unpack("<Q", take(8))
+    tags = {string(): string() for _ in range(count)}
+    if pos != len(data):
+        sys.exit(f"tags-dat: {len(data) - pos} trailing bytes (format changed?)")
+    return tags
+
+
+def encode(tags):
+    out = struct.pack("<Q", len(tags))
+    for key, value in tags.items():
+        for s in (key, value):
+            b = s.encode()
+            out += struct.pack("<Q", len(b)) + b
+    return out
+
+
+def main():
+    if sys.argv[1:] == ["decode"]:
+        json.dump(decode(sys.stdin.buffer.read()), sys.stdout, indent=1, ensure_ascii=False)
+        print()
+    elif sys.argv[1:] == ["encode"]:
+        tags = {k: v for k, v in json.load(sys.stdin).items() if v}
+        sys.stdout.buffer.write(encode(tags))
+    else:
+        sys.exit(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main()

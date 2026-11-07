@@ -1,0 +1,232 @@
+#!/usr/bin/env -S python3 -I
+"""Read and update Sophia NLU's web admin panel.
+
+The panel has no JSON API: it is server-rendered HTML with form posts behind
+a session cookie. This script logs in with the admin credentials on every run
+and parses the pages.
+
+Usage:
+  sophia-api entities [--tagged] [--area ID] [--domain D] [--search S]
+  sophia-api tag ENTITY_ID TAGS [ENTITY_ID TAGS ...]
+  sophia-api settings
+  sophia-api text PATH        # visible text of a page: log, about, license_info, sentences
+  sophia-api html PATH        # raw HTML of a page (GET only)
+
+`tag` replaces each entity's whole tag string ("" clears it) and prints the
+updated rows. Entities not named keep their tags.
+
+Environment:
+  SOPHIA_URL          panel URL (default http://127.0.0.1:10520)
+  SOPHIA_CREDENTIALS  directory holding `username` and `password` files
+                      (default $XDG_CONFIG_HOME/sophia-api, ~/.config/sophia-api)
+"""
+
+import argparse
+import html.parser
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.cookiejar import CookieJar
+
+URL = os.environ.get("SOPHIA_URL", "http://127.0.0.1:10520").rstrip("/")
+CREDENTIALS = os.environ.get("SOPHIA_CREDENTIALS") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "sophia-api")
+# Settings fields whose values are secrets: report only whether they're set.
+SECRET_FIELDS = {"llm_api_key", "ollama_api_key"}
+
+
+def die(msg):
+    print(f"sophia-api: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+class Session:
+    def __init__(self):
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    def request(self, path, form=None):
+        data = urllib.parse.urlencode(form).encode() if form is not None else None
+        req = urllib.request.Request(URL + "/" + path.lstrip("/"), data=data)
+        try:
+            with self.opener.open(req, timeout=30) as resp:
+                return urllib.parse.urlparse(resp.geturl()).path, resp.read().decode()
+        except urllib.error.HTTPError as e:
+            die(f"{e.code} {e.reason} for {path}")
+
+    def login(self):
+        creds = {}
+        for name in ("username", "password"):
+            try:
+                with open(os.path.join(CREDENTIALS, name)) as f:
+                    creds[name] = f.read().strip()
+            except OSError as e:
+                die(f"cannot read {CREDENTIALS}/{name}: {e.strerror} (set SOPHIA_CREDENTIALS)")
+        path, _ = self.request("login", creds)
+        if path.rstrip("/") == "/login":
+            die("login failed (wrong credentials?)")
+
+    def get(self, path):
+        final, body = self.request(path)
+        if final.rstrip("/") == "/login":
+            die(f"redirected to /login fetching {path}")
+        return body
+
+
+class Page(html.parser.HTMLParser):
+    """Collects forms, entity table rows, and visible text."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.forms, self.rows, self.text = [], [], []
+        self.section = None
+        self._form = self._row = self._cell = self._select = None
+        self._header = self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        cls = a.get("class") or ""
+        if tag in ("script", "style", "nav", "footer"):
+            self._skip += 1
+        elif tag == "form":
+            self._form = {"method": (a.get("method") or "get").lower(), "action": a.get("action"), "fields": {}}
+            self.forms.append(self._form)
+        elif tag == "span" and "fw-semibold" in cls and self._header:
+            self.section = ""
+            self._header = 2
+        elif tag == "div" and "card-header" in cls:
+            self._header = 1
+        elif tag == "tr":
+            self._row = {"cells": [], "tags": None}
+        elif tag == "td" and self._row is not None:
+            self._cell = []
+        elif tag == "input" and self._form is not None and a.get("name"):
+            name, kind = a["name"], a.get("type", "text")
+            if kind == "radio":
+                if "checked" in a:
+                    self._form["fields"][name] = a.get("value")
+                else:
+                    self._form["fields"].setdefault(name, None)
+            elif kind not in ("submit", "button"):
+                self._form["fields"][name] = a.get("value", "")
+            if name.startswith("tag_") and self._row is not None:
+                self._row["tags"] = a.get("value", "")
+        elif tag == "select" and self._form is not None:
+            self._select = a.get("name")
+            self._form["fields"][self._select] = ""
+        elif tag == "option" and self._select and "selected" in a:
+            self._form["fields"][self._select] = a.get("value", "")
+        elif tag == "textarea" and self._form is not None:
+            self._form["fields"][a.get("name")] = ""
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "nav", "footer"):
+            self._skip -= 1
+        elif tag == "form":
+            self._form = None
+        elif tag == "select":
+            self._select = None
+        elif tag == "span" and self._header == 2:
+            self._header = 0
+            self.section = self.section.strip()
+        elif tag == "td" and self._cell is not None:
+            self._row["cells"].append(" ".join("".join(self._cell).split()))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            cells = self._row["cells"]
+            if self._row["tags"] is not None and len(cells) >= 4:
+                self.rows.append({"section": self.section, "type": cells[1], "name": cells[2],
+                                  "entity_id": cells[3], "tags": self._row["tags"]})
+            self._row = None
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        if self._header == 2:
+            self.section += data
+        if self._cell is not None:
+            self._cell.append(data)
+        self.text.append(data)
+
+    def visible_text(self):
+        lines = (line.strip() for line in "".join(self.text).splitlines())
+        return "\n".join(line for line in lines if line)
+
+
+def parse(body):
+    page = Page()
+    page.feed(body)
+    return page
+
+
+def entities(session, tagged=False, area=None, domain=None, search=None):
+    query = {k: v for k, v in (("filter", "tagged" if tagged else None), ("area", area),
+                               ("domain", domain), ("search", search)) if v}
+    return parse(session.get("entities" + ("?" + urllib.parse.urlencode(query) if query else ""))).rows
+
+
+def cmd_tag(session, pairs):
+    wanted = dict(zip(pairs[::2], pairs[1::2]))
+    known = {row["entity_id"] for row in entities(session)}
+    unknown = sorted(set(wanted) - known)
+    if unknown:
+        die(f"not loaded in Sophia: {', '.join(unknown)} (is it exposed to Assist?)")
+    # The panel merges: fields that aren't posted keep their tags.
+    session.request("entities/tags", {f"tag_{eid}": tags.strip() for eid, tags in wanted.items()})
+    return [row for row in entities(session) if row["entity_id"] in wanted]
+
+
+def cmd_settings(session):
+    fields = {}
+    for form in parse(session.get("settings")).forms:
+        if form["action"] == "settings":
+            fields = form["fields"]
+    # A hidden input with a fixed value, not the current Context Only state.
+    fields.pop("mode", None)
+    for name in SECRET_FIELDS & fields.keys():
+        fields[name] = "(set)" if fields[name] else ""
+    return fields
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    e = sub.add_parser("entities")
+    e.add_argument("--tagged", action="store_true")
+    e.add_argument("--area")
+    e.add_argument("--domain")
+    e.add_argument("--search")
+    t = sub.add_parser("tag")
+    t.add_argument("pairs", nargs="*", metavar="ENTITY_ID TAGS")
+    sub.add_parser("settings")
+    for name in ("text", "html"):
+        sub.add_parser(name).add_argument("path")
+    args = ap.parse_args()
+    if args.cmd == "tag" and (not args.pairs or len(args.pairs) % 2):
+        ap.error("tag takes ENTITY_ID TAGS pairs")
+
+    session = Session()
+    session.login()
+    if args.cmd == "entities":
+        out = entities(session, args.tagged, args.area, args.domain, args.search)
+    elif args.cmd == "tag":
+        out = cmd_tag(session, args.pairs)
+    elif args.cmd == "settings":
+        out = cmd_settings(session)
+    elif args.cmd == "text":
+        print(parse(session.get(args.path)).visible_text())
+        return
+    else:
+        if re.search(r"(^|/)(logout|login)\b", args.path):
+            die("refusing to fetch login/logout")
+        print(session.get(args.path))
+        return
+    json.dump(out, sys.stdout, indent=1, ensure_ascii=False)
+    print()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,54 @@
+diff --git a/custom_components/sophia_nlu/conversation.py b/custom_components/sophia_nlu/conversation.py
+index 2233261..75ac4f6 100644
+--- a/custom_components/sophia_nlu/conversation.py
++++ b/custom_components/sophia_nlu/conversation.py
+@@ -39,6 +39,9 @@ ALARM_INTENTS = frozenset(["HassAlarmSetMode", "HassAlarmDisarm", "HassAlarmTrig
+ ALARM_FIXED_SERVICES: dict[str, str] = {"HassAlarmDisarm": "alarm_disarm", "HassAlarmTrigger": "alarm_trigger"}
+ ALARM_MODE_SERVICES: dict[str, str] = {"home": "alarm_arm_home", "away": "alarm_arm_away", "night": "alarm_arm_night", "vacation": "alarm_arm_vacation", "custom_bypass": "alarm_arm_custom_bypass", "custom": "alarm_arm_custom_bypass"}
+ 
++# Vacuum intents that start a clean; the sentence's verb sets the mode first
++VACUUM_START_INTENTS = frozenset(["HassVacuumStart", "HassVacuumCleanArea"])
++
+ 
+ async def async_setup_entry(
+     hass: HomeAssistant,
+@@ -937,6 +940,29 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
+             return True, speech, entity_id
+         return False, None, None
+ 
++    async def _async_set_cleaning_mode(self, text: str, context: Any) -> None:
++        """Set the robot's cleaning mode from the sentence's verb before a vacuum intent starts it.
++
++        Sophia returns the same intent for "vacuum the bedroom" and "clean the
++        bedroom", and HA's vacuum intents can't carry a mode, so the verb is
++        read here: "vacuum" is vacuum only, "mop" is mop only, and "clean" or
++        anything else (or both verbs) is the default, vacuum then mop. The
++        robot's own name might be "the vacuum", so "clean" wins over it.
++        """
++        words = set(re.findall(r"[a-z]+", text.lower()))
++        mop = bool(words & {"mop", "mopping"})
++        vacuum = bool(words & {"vacuum", "vacuuming", "hoover", "hoovering"})
++        if words & {"clean", "cleaning", "cleanup"} or mop == vacuum:
++            mode = "vacuum_then_mop"
++        else:
++            mode = "mop" if mop else "vacuum"
++        try:
++            await self.hass.services.async_call(
++                "script", "set_cleaning_mode", {"mode": mode}, blocking=True, context=context
++            )
++        except Exception as err:
++            _LOGGER.error("Could not set the cleaning mode to %s: %s", mode, err)
++
+     async def _async_handle_alarm_intent(self, intent_name: str, slots: dict[str, Any], common_name: str | None, context: Any) -> dict[str, Any]:
+         """Execute an alarm intent via alarm_control_panel services and return the per-intent context entry.
+ 
+@@ -1102,6 +1128,9 @@ class SophiaNLUConversationEntity(conversation.ConversationEntity):
+             if len(devices) != 1:
+                 common_name = None
+ 
++            if intent_name in VACUUM_START_INTENTS:
++                await self._async_set_cleaning_mode(user_input.text, user_input.context)
++
+             # Alarm intents map directly to alarm_control_panel services
+             if intent_name in ALARM_INTENTS:
+                 intents_context.append(await self._async_handle_alarm_intent(intent_name, slots, common_name, user_input.context))

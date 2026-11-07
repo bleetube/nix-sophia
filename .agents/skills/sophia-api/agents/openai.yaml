@@ -1,0 +1,3 @@
+interface:
+  display_name: "Sophia NLU API"
+  short_description: "Read settings and manage entity tags in Sophia NLU's admin panel"
